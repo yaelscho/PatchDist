@@ -4,10 +4,12 @@ from __future__ import print_function
 
 import random
 import shutil
+import threading
 from collections import Counter
 from itertools import combinations_with_replacement as comb
 import sklearn
 import cv2
+import cupy as cp
 import matplotlib.pyplot as plt
 import sklearn.metrics
 import pickle
@@ -19,7 +21,8 @@ import math
 import time
 from scipy.io import loadmat
 import numba
-from numba import jit, njit
+from numba import jit, cuda
+from numba.extending import overload
 import os
 from PIL import Image
 import tensorflow_datasets as tfds
@@ -33,6 +36,10 @@ from pycocotools.coco import COCO
 import multiprocessing
 import resnet50_input
 import resnet50
+import logging
+import torch.nn as nn
+
+logging.getLogger('numba').setLevel(20)
 
 FLAGS = tf.compat.v1.app.flags.FLAGS
 
@@ -103,24 +110,38 @@ def calcPatchDist(patch1, patch2):
   dist2 = np.mean([np.amin([np.linalg.norm(pix2 - pix1, 2) for pix2 in patch2]) for pix1 in patch1])
   return np.mean([dist1, dist2])
 
+@jit(parallel=True)
+def distances(X, Y):
+  dist = np.zeros((X.shape[0], Y.shape[0]))
+  dist = (X ** 2).sum(axis=1)[:, np.newaxis] + (Y ** 2).sum(axis=1) - 2 * np.matmul(X, Y.T)
+  dist[dist<0] = 0
+  return dist
+# @jit(parallel=True)
 
-@njit(parallel=True)
-def calcPatchDistmulti(doues):
-  dissim = np.zeros((4224, 4224))
-  for dou in tqdm(doues):
-    p1, p2 = dou
-    patch1 = p1['patch']
-    patch2 = p2['patch']
-    if len(patch1.shape)>2:
-      patch1 = patch1.reshape(patch1.shape[0]*patch1.shape[1], patch1.shape[2])
-      patch2 = patch2.reshape(patch2.shape[0] * patch2.shape[1], patch2.shape[2])
-    dist1 = np.mean([np.amin([np.linalg.norm(pix2-pix1,2) for pix1 in patch1]) for pix2 in patch2])
-    dist2 = np.mean([np.amin([np.linalg.norm(pix2 - pix1, 2) for pix2 in patch2]) for pix1 in patch1])
-  dissim[p1['idx'], p2['idx']] = np.mean([dist1, dist2])
-  dissim[p2['idx'], p1['idx']] = np.mean([dist1, dist2])
-  return dissim
+def calcPatchDistmulti(dou):
+  # for dou in tqdm(doues):
+  p1, p2 = dou
+  patch1 = p1['patch']
+  patch2 = p2['patch']
+  if len(patch1.shape)>2:
+    patch1 = patch1.reshape(patch1.shape[0]*patch1.shape[1], patch1.shape[2])
+    patch2 = patch2.reshape(patch2.shape[0] * patch2.shape[1], patch2.shape[2])
+  dist = np.sqrt(distances(patch1, patch2))
+  dist1_vec = np.amin(dist, axis=0)
+  dist2_vec = np.amin(dist, axis=1)
+  w1 = 1/np.sqrt(1+ np.around(dist1_vec, decimals=-1))
+  w2 = 1/np.sqrt(1+ np.around(dist2_vec, decimals=-1))
+  dist1 = np.average(dist1_vec, weights=w1)
+  dist2 = np.average(dist2_vec, weights=w2)
+  # dist = distances(patch1, patch2)
+  # dist1 = np.mean(np.sqrt(np.amin(dist, axis=0)))
+  # dist2 = np.mean(np.sqrt(np.amin(dist, axis=1)))
+  # dist2 = np.mean([np.amin([np.linalg.norm(pix2 - pix1, 2) for pix2 in patch2]) for pix1 in patch1])
+  # dissim[p1['idx'], p2['idx']] = np.mean([dist1, dist2])
+  # dissim[p2['idx'], p1['idx']] = np.mean([dist1, dist2])
+  return p1['idx'], p2['idx'], np.mean(np.array([dist1, dist2]))
 
-# @jit(target_backend='cuda')
+# @cuda.jit
 def calcPatchDisttorch(patch1, patch2):
   if len(patch1.shape)>2:
     patch1 = patch1.reshape(patch1.shape[0]*patch1.shape[1], patch1.shape[2]).to('cuda')
@@ -128,7 +149,77 @@ def calcPatchDisttorch(patch1, patch2):
   dist1 = torch.mean(torch.Tensor([torch.amin(torch.Tensor([torch.linalg.norm(pix2-pix1,2) for pix1 in patch1])) for pix2 in patch2]))
   dist2 = torch.mean(torch.Tensor([torch.amin(torch.Tensor([torch.linalg.norm(pix2-pix1,2) for pix2 in patch2])) for pix1 in patch1]))
   return torch.mean(torch.Tensor([dist1, dist2]))
+  patch1 = p1['patch']
+  patch2 = p2['patch']
+  if len(patch1.shape) > 2:
+    patch1 = patch1.reshape(patch1.shape[0] * patch1.shape[1], patch1.shape[2])
+    patch2 = patch2.reshape(patch2.shape[0] * patch2.shape[1], patch2.shape[2])
+  dist1 = np.mean([np.amin([np.linalg.norm(pix2 - pix1, 2) for pix1 in patch1]) for pix2 in patch2])
+  dist2 = np.mean([np.amin([np.linalg.norm(pix2 - pix1, 2) for pix2 in patch2]) for pix1 in patch1])
 
+
+# @overload(np.amin)
+# def jit_min(dist, axis):
+#   dmin = []
+#   if axis==0:
+#     for i in range(dist.shape[axis]):
+#       d = np.Inf
+#       for k in range(dist.shape[1-axis]):
+#         if dist[i, k] < d:
+#           d = dist[i,k]
+#       dmin.append(d)
+#     return np.array(dmin).mean()
+#   if axis ==1:
+#     for i in range(dist.shape[axis]):
+#       d = np.Inf
+#       for k in range(dist.shape[1-axis]):
+#         if dist[k, i] < d:
+#           d = dist[k, i]
+#       dmin.append(d)
+#     return np.array(dmin).mean()
+#
+#
+# @overload(np.linalg.norm)
+# def oneD_norm_2(a):
+#   val = np.abs(a)
+#   return np.sqrt(np.sum(val*val))
+#
+#
+# @cuda.jit()
+# def calcDistGPUPar(patches, dissim):
+#   i, j = cuda.grid(2)
+#   if i<4224 and j<4224:
+#     for patch1 in patches:
+#       for patch2 in patches:
+#         if len(patch1.shape) > 2:
+#           p1 = patch1.copy()
+#           p1 = p1.reshape(patch1.shape[0] * patch1.shape[1], patch1.shape[2])
+#           p2 = patch2.copy()
+#           p2 = p2.reshape(patch2.shape[0] * patch2.shape[1], patch2.shape[2])
+#         dist = np.zeros((p1.shape[0], p2.shape[0]))
+#         for l, pix1 in enumerate(p1):
+#           for k, pix2 in enumerate(p2):
+#             dist[l,k] = np.linalg.norm(pix2 - pix1)
+#         dist = np.array([np.amin(np.array([np.linalg.norm(pix2 - pix1) for pix1 in p1])) for pix2 in p2])
+#   #       # dist2 = np.array([np.array([np.linalg.norm(pix2 - pix1, 2) for pix2 in p2]) for pix1 in p1])
+#   #       dmin0 = []
+#   #       for i in range(dist.shape[0]):
+#   #         d = np.Inf
+#   #         for k in range(dist.shape[1]):
+#   #           if dist[i, k] < d:
+#   #             d = dist[i, k]
+#   #         dmin0.append(d)
+#   #       dmin1 = []
+#   #       for i in range(dist.shape[1]):
+#   #         d = np.Inf
+#   #         for k in range(dist.shape[0]):
+#   #           if dist[k, i] < d:
+#   #             d = dist[k, 1]
+#   #         dmin1.append(d)
+#   #       d = np.array([np.array(dmin1).mean(), np.array(dmin0).mean()]).mean()
+#   #       dissim[i, j] = d
+#   #       dissim[j, i] = d
+#   # return dissim
 
 def getPatchDS(sess, image, GT, fuse, patch_size=4, ifPCA=True, n=16):
   pos_dist = []
@@ -448,6 +539,26 @@ def calcdissim(patches):
   return dissim
 
 
+# class metric1(nn.Module()):
+#   def __init__(self, p1, p2):
+#     super(Model, self).__init__()
+#     self.p1 = p1['patch']
+#     self.p2 = p2['patch']
+#
+#   def calcPatchD(self, p, patches):
+#
+#   def nearest_redi(X, Y):
+#     dist = np.zeros((X.shape[0], Y.shape[0]))
+#     dist = (X ** 2).sum(axis=1)[:, np.newaxis] + (Y ** 2).sum(axis=1) - 2 * X.dot(Y.T)
+#   def forward(self, input):
+#     output = self.fc(input)
+#     print("\tIn Model: input size", input.size(),
+#           "output size", output.size())
+#
+#     return output
+#
+
+
 def get_representations():
   imagenette = False
   coco = True
@@ -668,188 +779,346 @@ def get_representations():
 
       coord.request_stop()
       coord.join(threads, stop_grace_period_secs=10)
+  # elif coco:
+  #   image,mask, label = getRep_coco()
+  #   _, _, fuse = resnet50.inference(image, tf.zeros(
+  #     [1, image.shape[1] // 4 + image.shape[1] % 4, image.shape[2] // 4 + image.shape[2] % 4,
+  #      resnet50_input.NUM_CLASSES]), tf.zeros(
+  #     [1, image.shape[1] // 4 + image.shape[1] % 4, image.shape[2] // 4 + image.shape[2] % 4,
+  #      resnet50_input.NUM_CLASSES]))
+  #   saver = tf.train.Saver(tf.global_variables())
+  #   with tf.Session(config=tf.ConfigProto(inter_op_parallelism_threads=1,
+  #                                         intra_op_parallelism_threads=1)) as sess:
+  #     sess.run(tf.group(tf.initialize_all_variables(),
+  #                       tf.initialize_local_variables()))
+  #     ckpt = tf.train.get_checkpoint_state(FLAGS.train_dir)
+  #     if ckpt and ckpt.model_checkpoint_path:
+  #       saver.restore(sess, ckpt.model_checkpoint_path)
+  #     else:
+  #       print('No checkpoint file found')
+  #       return
+  #     # Start the queue runners.
+  #     coord = tf.train.Coordinator()
+  #     try:
+  #       threads = []
+  #       for qr in tf.get_collection(tf.GraphKeys.QUEUE_RUNNERS):
+  #         threads.extend(qr.create_threads(sess, coord=coord, daemon=False,
+  #                                          start=True))
+  #       # patches = getPatchDS_COCO(sess, image, mask, label, fuse, patch_size=8, ifPCA=True, n=16)
+  #       #
+  #       # with open('patches_8_coco.pkl', 'wb') as f:
+  #       #   pickle.dump(patches, f)
+  #       with open('patches_8_coco.pkl', 'rb') as f:
+  #         patches = pickle.load(f)
+  #       # patches = random.choices(patches, k=500)
+  #       # threads_per_block = (16,16)
+  #       # blocks_per_grid = ((4224+16-1)//16, (4224+16-1)//16)
+  #       # patches_array = [p['patch'] for p in patches]
+  #       # patches_cuda = cuda.to_device(patches_array)
+  #       doues = comb(patches, 2)
+  #       # dissim = calcPatchDistmulti(doues)
+  #       dissim = np.zeros((4224, 4224))
+  #       # dissim = cuda.to_device(dissim)
+  #       # dissim = calcDistGPUPar[blocks_per_grid,threads_per_block](patches_cuda, dissim)
+  #       # with multiprocessing.Pool(processes=16) as p:
+  #       #   with tqdm(total=(4224 ** 2)/2) as pbar:
+  #       #     for d in p.imap_unordered(calcPatchDistmulti, doues):
+  #       #       pbar.update()
+  #       #       dissim[d[0], d[1]] = d[2]
+  #       #       dissim[d[1], d[0]] = d[2]
+  #       # # for p1 in tqdm(patches):
+  #       # #   for p2 in patches:
+  #       # #     if dissim[p1['idx'], p2['idx']] != 0:
+  #       # #       continue
+  #       # #     else:
+  #       # #       # start = time.time()
+  #       # #       # patch1 = torch.from_numpy(p1['patch'])
+  #       # #       # patch2 = torch.from_numpy(p2['patch'])
+  #       # #       # dist = calcPatchDisttorch(patch1, patch2)
+  #       # #       dist = calcPatchDist(p1['patch'], p2['patch'])
+  #       # #       dissim[p1['idx'], p2['idx']] = dist
+  #       # #       dissim[p2['idx'], p1['idx']] = dist
+  #       # #       # print(time.time()-start)
+  #       with open('dissim_8_coco_{}.pkl'.format(datetime.now()), 'wb') as f:
+  #         pickle.dump(dissim, f)
+  #       # with open('dissim_8_coco.pkl', 'rb') as f:
+  #       #   dissim = pickle.load(f)
+  #       max_d = np.amax(dissim)
+  #       affinity = 1 - (dissim / max_d)
+  #       sigma = np.mean(dissim)
+  #       affinity = np.exp(-dissim/sigma)
+  #       D = np.zeros(affinity.shape)
+  #       for i in range(affinity.shape[0]):
+  #         D[i, i] = sum(affinity[i, :])
+  #       L = np.matmul(np.matmul(np.diag(np.diag(D) ** (-1 / 2)), affinity), np.diag(np.diag(D) ** (-1 / 2)))
+  #       eig = np.linalg.eig(L)
+  #       # vLens = range(6, 51, 2)
+  #       vLens = [40]
+  #       clustersCenterD = []
+  #       inClustersD = []
+  #       ns = range(10,51,5)
+  #       # ns = [40]
+  #       fig2, ax2 = plt.subplots()
+  #       for n in ns:
+  #         for vLen in vLens:
+  #           space = eig[1][:, :vLen]
+  #           normalize_f = np.sqrt((np.sum(np.square(space), axis=1)))
+  #           Y = (space.T / normalize_f).T
+  #           Kmeans = sklearn.cluster.KMeans(n_clusters=n, algorithm='elkan')
+  #           clusters = Kmeans.fit(Y)
+  #           clusters_trans = Kmeans.fit_transform(Y)
+  #           clustersCenterD.append(np.mean(
+  #             [[np.linalg.norm((clusters.cluster_centers_[i, :]-clusters.cluster_centers_[j, :]), 2) for i in range(n)]
+  #              for j in range(n) if i != j]))
+  #           inClustersD.append(np.mean([np.linalg.norm((Y[i]-clusters.cluster_centers_[clusters.labels_[i]]),2) for i in range(len(patches))]))
+  #       # plot the change in the distances according to the size of the new patches descriptors
+  #       #   ax2.plot(vLens, clustersCenterD[-len(vLens):], label='cluster centers mean distance n={}'.format(n))
+  #       #   ax2.plot(vLens, inClustersD[-len(vLens):], label='in-clusters mean distance n={}'.format(n))
+  #       #   ax2.set_xlabel('# eig vec')
+  #       #   ax2.set_ylabel('mean distance')
+  #       #   ax2.legend()
+  #
+  #       # simulate and test the population of one cluster
+  #         population = np.zeros((n, 10)) # 0- Airplane 1- Airplane backgrouns 2- dog 3- dog background 4- elephant /
+  #         # 5- elephant background 6- fire hydrant 7- fire hydrant background 8- train 9- train background
+  #         clustersNames = range(n)
+  #         labelsNames = ['Airplane', 'Airplane backgrouns', 'dog', 'dog background','elephant',
+  #         'elephant background', 'fire hydrant', 'fire hydrant background', 'train', 'train background']
+  #         for clusterIDX in range(n):
+  #           idxlist = np.where(clusters.labels_ == clusterIDX)
+  #           print(len(idxlist)/len(patches))
+  #           GT_cluster = [(p['label'], p['seg']) for p in patches if p['idx'] in idxlist[0]]
+  #           classesPop = np.unique(GT_cluster, return_counts=True, axis=0)
+  #           for i, pop in enumerate(classesPop[0]):
+  #             if b'airplane' in pop and b'255' in pop:
+  #               classesPop[0][i] = 0
+  #               population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+  #             if b'airplane' in pop and b'0' in pop:
+  #               classesPop[0][i] = 1
+  #               population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+  #             if b'dog' in pop and b'255' in pop:
+  #               classesPop[0][i] = 2
+  #               population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+  #             if b'dog' in pop and b'0' in pop:
+  #               classesPop[0][i] = 3
+  #               population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+  #             if b'fire hydrant' in pop and b'255' in pop:
+  #               classesPop[0][i] = 6
+  #               population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+  #             if b'fire hydrant' in pop and b'0' in pop:
+  #               classesPop[0][i] = 7
+  #               population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+  #             if b'elephant' in pop and b'255' in pop:
+  #               classesPop[0][i] = 4
+  #               population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+  #             if b'elephant' in pop and b'0' in pop:
+  #               classesPop[0][i] = 5
+  #               population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+  #             if b'train' in pop and b'255' in pop:
+  #               classesPop[0][i] = 8
+  #               population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+  #             if b'train' in pop and b'0' in pop:
+  #               classesPop[0][i] = 9
+  #               population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+  #         fig, ax = plt.subplots()
+  #         im = ax.imshow(population)
+  #         ax.set_yticks(np.arange(len(clustersNames)))
+  #         ax.set_xticks(np.arange(len(labelsNames)))
+  #         cb = plt.colorbar(im)
+  #         plt.savefig('heatmaps_coco_clustering/popHeatmap_{}_clusters_{}_eigvecs.png'.format(n, vLen))
+  #         plt.close(fig)
+  #         # population[clusterIDX, classesPop[0]] = classesPop[1]
+  #         # plt.pie(np.unique(GT_cluster, return_counts=True, axis=0)[1],
+  #         #         labels=np.unique(GT_cluster, return_counts=True, axis=0)[0])
+  #       # plt.show()
+  #       # plt.savefig('keepDaway.png')
+  #       # plt.close(fig2)
+  #       fig, ax = plt.subplots()
+  #       ax.imshow(population)
+  #       ax.set_yticks(np.arange(len(clustersNames)), labels=clustersNames)
+  #       ax.set_xticks(np.arange(len(labelsNames)), labels=labelsNames)
+  #       ims = [p['ref'] for p in patches if p['idx'] in idxlist[0]]
+  #       random.shuffle(ims)
+  #       fig, axs = plt.subplots(6, 6)
+  #       for i in range(6):
+  #         for j in range(6):
+  #           axs[i, j].imshow(ims[i * 6 + j])
+  #       plt.show()
+  #       # patches = sorted(patches, key=lambda p: p['idx'])
+  #       # mymetric = sklearn.metrics.make_scorer(calcPatchDist)
+  #       # clustering_kmeans = SpectralClustering(n_clusters=50,
+  #       #                                        assign_labels='kmeans',
+  #       #                                        random_state=0,
+  #       #                                        affinity='nearest_neighbors').fit(
+  #       #   np.array([p['patch'].flatten() for p in patches]))
+  #       # clustering_disc = SpectralClustering(n_clusters=50,
+  #       #                                      assign_labels='discretize',
+  #       #                                      random_state=0,
+  #       #                                      affinity='nearest_neighbors').fit(
+  #       #   np.array([p['patch'].flatten() for p in patches]))
+  #       #
+  #       # plt.hist(clustering_disc.labels_, bins=50)
+  #       # plt.hist(clustering_kmeans.labels_, bins=50)
+  #
+  #
+  #     except Exception as e:  # pylint: disable=broad-except
+  #       coord.request_stop(e)
+  #
+  #     coord.request_stop()
+  #     coord.join(threads, stop_grace_period_secs=10)
   elif coco:
-    image,mask, label = getRep_coco()
-    _, _, fuse = resnet50.inference(image, tf.zeros(
-      [1, image.shape[1] // 4 + image.shape[1] % 4, image.shape[2] // 4 + image.shape[2] % 4,
-       resnet50_input.NUM_CLASSES]), tf.zeros(
-      [1, image.shape[1] // 4 + image.shape[1] % 4, image.shape[2] // 4 + image.shape[2] % 4,
-       resnet50_input.NUM_CLASSES]))
-    saver = tf.train.Saver(tf.global_variables())
-    with tf.Session(config=tf.ConfigProto(inter_op_parallelism_threads=1,
-                                          intra_op_parallelism_threads=1)) as sess:
-      sess.run(tf.group(tf.initialize_all_variables(),
-                        tf.initialize_local_variables()))
-      ckpt = tf.train.get_checkpoint_state(FLAGS.train_dir)
-      if ckpt and ckpt.model_checkpoint_path:
-        saver.restore(sess, ckpt.model_checkpoint_path)
-      else:
-        print('No checkpoint file found')
-        return
-      # Start the queue runners.
-      coord = tf.train.Coordinator()
-      try:
-        threads = []
-        for qr in tf.get_collection(tf.GraphKeys.QUEUE_RUNNERS):
-          threads.extend(qr.create_threads(sess, coord=coord, daemon=False,
-                                           start=True))
-        # patches = getPatchDS_COCO(sess, image, mask, label, fuse, patch_size=8, ifPCA=True, n=16)
-        #
-        # with open('patches_8_coco.pkl', 'wb') as f:
-        #   pickle.dump(patches, f)
-        with open('patches_8_coco.pkl', 'rb') as f:
-          patches = pickle.load(f)
+    with open('patches_8_coco.pkl', 'rb') as f:
+      patches = pickle.load(f)
         # patches = random.choices(patches, k=500)
+        # threads_per_block = (16,16)
+        # blocks_per_grid = ((4224+16-1)//16, (4224+16-1)//16)
+        # patches_array = [p['patch'] for p in patches]
+        # patches_cuda = cuda.to_device(patches_array)
+      doues = comb(patches, 2)
+      # # dissim = calcPatchDistmulti(doues)
+      dissim = np.zeros((4224, 4224))
+      # device = 'cuda'
+        # dissim = cuda.to_device(dissim)
+        # dissim = calcDistGPUPar[blocks_per_grid,threads_per_block](patches_cuda, dissim)
+      with multiprocessing.Pool(processes=16) as p:
+        with tqdm(total=(4224 ** 2)/2) as pbar:
+          for d in p.imap_unordered(calcPatchDistmulti, doues):
+            pbar.update()
+            dissim[d[0], d[1]] = d[2]
+            dissim[d[1], d[0]] = d[2]
+      #   # # for p1 in tqdm(patches):
+      #   # #   for p2 in patches:
+      #   # #     if dissim[p1['idx'], p2['idx']] != 0:
+      #   # #       continue
+      #   # #     else:
+      #   # #       # start = time.time()
+      #   # #       # patch1 = torch.from_numpy(p1['patch'])
+      #   # #       # patch2 = torch.from_numpy(p2['patch'])
+      #   # #       # dist = calcPatchDisttorch(patch1, patch2)
+      #   # #       dist = calcPatchDist(p1['patch'], p2['patch'])
+      #   # #       dissim[p1['idx'], p2['idx']] = dist
+      #   # #       dissim[p2['idx'], p1['idx']] = dist
+      #   # #       # print(time.time()-start)
+      with open('dissim_8_coco_{}.pkl'.format(datetime.now()), 'wb') as f:
+        pickle.dump(dissim, f)
+    # with open('dissim_8_coco_2023-03-26 20:30:01.277168.pkl', 'rb') as f:
+    #   dissim = pickle.load(f)
+    max_d = np.amax(dissim)
+    affinity = 1 - (dissim / max_d)
+    sigma = np.mean(dissim)
+    affinity = np.exp(-dissim/sigma)
+    D = np.zeros(affinity.shape)
+    for i in range(affinity.shape[0]):
+      D[i, i] = sum(affinity[i, :])
+    L = np.matmul(np.matmul(np.diag(np.diag(D) ** (-1 / 2)), affinity), np.diag(np.diag(D) ** (-1 / 2)))
+    eig = np.linalg.eig(L)
+    vLens = range(6, 51, 2)
+    # vLens = [40]
+    clustersCenterD = []
+    inClustersD = []
+    ns = range(10,51,5)
+    # ns = [40]
+    fig2, ax2 = plt.subplots()
+    for n in ns:
+      for vLen in vLens:
+        space = eig[1][:, :vLen]
+        normalize_f = np.sqrt((np.sum(np.square(space), axis=1)))
+        Y = (space.T / normalize_f).T
+        Kmeans = sklearn.cluster.KMeans(n_clusters=n, algorithm='elkan')
+        clusters = Kmeans.fit(Y)
+        clusters_trans = Kmeans.fit_transform(Y)
+        clustersCenterD.append(np.mean(
+          [[np.linalg.norm((clusters.cluster_centers_[i, :]-clusters.cluster_centers_[j, :]), 2) for i in range(n)]
+           for j in range(n) if i != j]))
+        inClustersD.append(np.mean([np.linalg.norm((Y[i]-clusters.cluster_centers_[clusters.labels_[i]]),2) for i in range(len(patches))]))
+    # plot the change in the distances according to the size of the new patches descriptors
+      ax2.plot(vLens, clustersCenterD[-len(vLens):], label='cluster centers mean distance n={}'.format(n))
+      ax2.plot(vLens, inClustersD[-len(vLens):], label='in-clusters mean distance n={}'.format(n))
+      ax2.set_xlabel('# eig vec')
+      ax2.set_ylabel('mean distance')
+      ax2.legend()
 
-        doues = comb(patches, 2)
-        dissim = calcPatchDistmulti(doues)
-        # with multiprocessing.Pool(processes=16) as p:
-        #   with tqdm(total=(4224 ** 2)/2) as pbar:
-        #     for d in p.imap_unordered(calcPatchDistmulti, doues):
-        #       pbar.update()
-        #       dissim[d[0], d[1]] = d[2]
-        #       dissim[d[1], d[0]] = d[2]
-        # # for p1 in tqdm(patches):
-        # #   for p2 in patches:
-        # #     if dissim[p1['idx'], p2['idx']] != 0:
-        # #       continue
-        # #     else:
-        # #       # start = time.time()
-        # #       # patch1 = torch.from_numpy(p1['patch'])
-        # #       # patch2 = torch.from_numpy(p2['patch'])
-        # #       # dist = calcPatchDisttorch(patch1, patch2)
-        # #       dist = calcPatchDist(p1['patch'], p2['patch'])
-        # #       dissim[p1['idx'], p2['idx']] = dist
-        # #       dissim[p2['idx'], p1['idx']] = dist
-        # #       # print(time.time()-start)
-        with open('dissim_8_coco_{}.pkl'.format(datetime.now()), 'wb') as f:
-          pickle.dump(dissim, f)
-        # with open('dissim_8_coco.pkl', 'rb') as f:
-        #   dissim = pickle.load(f)
-        max_d = np.amax(dissim)
-        affinity = 1 - (dissim / max_d)
-        sigma = np.mean(dissim)
-        affinity = np.exp(-dissim/sigma)
-        D = np.zeros(affinity.shape)
-        for i in range(affinity.shape[0]):
-          D[i, i] = sum(affinity[i, :])
-        L = np.matmul(np.matmul(np.diag(np.diag(D) ** (-1 / 2)), affinity), np.diag(np.diag(D) ** (-1 / 2)))
-        eig = np.linalg.eig(L)
-        # vLens = range(6, 51, 2)
-        vLens = [40]
-        clustersCenterD = []
-        inClustersD = []
-        ns = range(10,51,5)
-        # ns = [40]
-        fig2, ax2 = plt.subplots()
-        for n in ns:
-          for vLen in vLens:
-            space = eig[1][:, :vLen]
-            normalize_f = np.sqrt((np.sum(np.square(space), axis=1)))
-            Y = (space.T / normalize_f).T
-            Kmeans = sklearn.cluster.KMeans(n_clusters=n, algorithm='elkan')
-            clusters = Kmeans.fit(Y)
-            clusters_trans = Kmeans.fit_transform(Y)
-            clustersCenterD.append(np.mean(
-              [[np.linalg.norm((clusters.cluster_centers_[i, :]-clusters.cluster_centers_[j, :]), 2) for i in range(n)]
-               for j in range(n) if i != j]))
-            inClustersD.append(np.mean([np.linalg.norm((Y[i]-clusters.cluster_centers_[clusters.labels_[i]]),2) for i in range(len(patches))]))
-        # plot the change in the distances according to the size of the new patches descriptors
-        #   ax2.plot(vLens, clustersCenterD[-len(vLens):], label='cluster centers mean distance n={}'.format(n))
-        #   ax2.plot(vLens, inClustersD[-len(vLens):], label='in-clusters mean distance n={}'.format(n))
-        #   ax2.set_xlabel('# eig vec')
-        #   ax2.set_ylabel('mean distance')
-        #   ax2.legend()
-
-        # simulate and test the population of one cluster
-          population = np.zeros((n, 10)) # 0- Airplane 1- Airplane backgrouns 2- dog 3- dog background 4- elephant /
-          # 5- elephant background 6- fire hydrant 7- fire hydrant background 8- train 9- train background
-          clustersNames = range(n)
-          labelsNames = ['Airplane', 'Airplane backgrouns', 'dog', 'dog background','elephant',
-          'elephant background', 'fire hydrant', 'fire hydrant background', 'train', 'train background']
-          for clusterIDX in range(n):
-            idxlist = np.where(clusters.labels_ == clusterIDX)
-            print(len(idxlist)/len(patches))
-            GT_cluster = [(p['label'], p['seg']) for p in patches if p['idx'] in idxlist[0]]
-            classesPop = np.unique(GT_cluster, return_counts=True, axis=0)
-            for i, pop in enumerate(classesPop[0]):
-              if b'airplane' in pop and b'255' in pop:
-                classesPop[0][i] = 0
-                population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
-              if b'airplane' in pop and b'0' in pop:
-                classesPop[0][i] = 1
-                population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
-              if b'dog' in pop and b'255' in pop:
-                classesPop[0][i] = 2
-                population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
-              if b'dog' in pop and b'0' in pop:
-                classesPop[0][i] = 3
-                population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
-              if b'fire hydrant' in pop and b'255' in pop:
-                classesPop[0][i] = 6
-                population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
-              if b'fire hydrant' in pop and b'0' in pop:
-                classesPop[0][i] = 7
-                population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
-              if b'elephant' in pop and b'255' in pop:
-                classesPop[0][i] = 4
-                population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
-              if b'elephant' in pop and b'0' in pop:
-                classesPop[0][i] = 5
-                population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
-              if b'train' in pop and b'255' in pop:
-                classesPop[0][i] = 8
-                population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
-              if b'train' in pop and b'0' in pop:
-                classesPop[0][i] = 9
-                population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
-          fig, ax = plt.subplots()
-          im = ax.imshow(population)
-          ax.set_yticks(np.arange(len(clustersNames)))
-          ax.set_xticks(np.arange(len(labelsNames)))
-          cb = plt.colorbar(im)
-          plt.savefig('heatmaps_coco_clustering/popHeatmap_{}_clusters_{}_eigvecs.png'.format(n, vLen))
-          plt.close(fig)
-          # population[clusterIDX, classesPop[0]] = classesPop[1]
-          # plt.pie(np.unique(GT_cluster, return_counts=True, axis=0)[1],
-          #         labels=np.unique(GT_cluster, return_counts=True, axis=0)[0])
-        # plt.show()
-        # plt.savefig('keepDaway.png')
-        # plt.close(fig2)
-        fig, ax = plt.subplots()
-        ax.imshow(population)
-        ax.set_yticks(np.arange(len(clustersNames)), labels=clustersNames)
-        ax.set_xticks(np.arange(len(labelsNames)), labels=labelsNames)
-        ims = [p['ref'] for p in patches if p['idx'] in idxlist[0]]
-        random.shuffle(ims)
-        fig, axs = plt.subplots(6, 6)
-        for i in range(6):
-          for j in range(6):
-            axs[i, j].imshow(ims[i * 6 + j])
-        plt.show()
-        # patches = sorted(patches, key=lambda p: p['idx'])
-        # mymetric = sklearn.metrics.make_scorer(calcPatchDist)
-        # clustering_kmeans = SpectralClustering(n_clusters=50,
-        #                                        assign_labels='kmeans',
-        #                                        random_state=0,
-        #                                        affinity='nearest_neighbors').fit(
-        #   np.array([p['patch'].flatten() for p in patches]))
-        # clustering_disc = SpectralClustering(n_clusters=50,
-        #                                      assign_labels='discretize',
-        #                                      random_state=0,
-        #                                      affinity='nearest_neighbors').fit(
-        #   np.array([p['patch'].flatten() for p in patches]))
-        #
-        # plt.hist(clustering_disc.labels_, bins=50)
-        # plt.hist(clustering_kmeans.labels_, bins=50)
-
-
-      except Exception as e:  # pylint: disable=broad-except
-        coord.request_stop(e)
-
-      coord.request_stop()
-      coord.join(threads, stop_grace_period_secs=10)
-
+    # # simulate and test the population of one cluster
+    #   population = np.zeros((n, 10)) # 0- Airplane 1- Airplane backgrouns 2- dog 3- dog background 4- elephant /
+    #   # 5- elephant background 6- fire hydrant 7- fire hydrant background 8- train 9- train background
+    #   clustersNames = range(n)
+    #   labelsNames = ['Airplane', 'Airplane backgrouns', 'dog', 'dog background','elephant',
+    #   'elephant background', 'fire hydrant', 'fire hydrant background', 'train', 'train background']
+    #   for clusterIDX in range(n):
+    #     idxlist = np.where(clusters.labels_ == clusterIDX)
+    #     print(len(idxlist)/len(patches))
+    #     GT_cluster = [(p['label'], p['seg']) for p in patches if p['idx'] in idxlist[0]]
+    #     classesPop = np.unique(GT_cluster, return_counts=True, axis=0)
+    #     for i, pop in enumerate(classesPop[0]):
+    #       if b'airplane' in pop and b'255' in pop:
+    #         classesPop[0][i] = 0
+    #         population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+    #       if b'airplane' in pop and b'0' in pop:
+    #         classesPop[0][i] = 1
+    #         population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+    #       if b'dog' in pop and b'255' in pop:
+    #         classesPop[0][i] = 2
+    #         population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+    #       if b'dog' in pop and b'0' in pop:
+    #         classesPop[0][i] = 3
+    #         population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+    #       if b'fire hydrant' in pop and b'255' in pop:
+    #         classesPop[0][i] = 6
+    #         population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+    #       if b'fire hydrant' in pop and b'0' in pop:
+    #         classesPop[0][i] = 7
+    #         population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+    #       if b'elephant' in pop and b'255' in pop:
+    #         classesPop[0][i] = 4
+    #         population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+    #       if b'elephant' in pop and b'0' in pop:
+    #         classesPop[0][i] = 5
+    #         population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+    #       if b'train' in pop and b'255' in pop:
+    #         classesPop[0][i] = 8
+    #         population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+    #       if b'train' in pop and b'0' in pop:
+    #         classesPop[0][i] = 9
+    #         population[clusterIDX, int(classesPop[0][i][0])] = classesPop[1][i]
+    #   fig, ax = plt.subplots()
+    #   im = ax.imshow(population)
+    #   ax.set_yticks(np.arange(len(clustersNames)))
+    #   ax.set_xticks(np.arange(len(labelsNames)))
+    #   cb = plt.colorbar(im)
+    #   plt.savefig('heatmaps_coco_clustering/popHeatmap_{}_clusters_{}_eigvecs.png'.format(n, vLen))
+    #   plt.close(fig)
+    #   # population[clusterIDX, classesPop[0]] = classesPop[1]
+    #   # plt.pie(np.unique(GT_cluster, return_counts=True, axis=0)[1],
+    #   #         labels=np.unique(GT_cluster, return_counts=True, axis=0)[0])
+    plt.show()
+    # plt.savefig('keepDaway.png')
+    plt.close(fig2)
+    fig, ax = plt.subplots()
+    ax.imshow(population)
+    ax.set_yticks(np.arange(len(clustersNames)), labels=clustersNames)
+    ax.set_xticks(np.arange(len(labelsNames)), labels=labelsNames)
+    ims = [p['ref'] for p in patches if p['idx'] in idxlist[0]]
+    random.shuffle(ims)
+    fig, axs = plt.subplots(6, 6)
+    for i in range(6):
+      for j in range(6):
+        axs[i, j].imshow(ims[i * 6 + j])
+    plt.show()
+    # patches = sorted(patches, key=lambda p: p['idx'])
+    # mymetric = sklearn.metrics.make_scorer(calcPatchDist)
+    # clustering_kmeans = SpectralClustering(n_clusters=50,
+    #                                        assign_labels='kmeans',
+    #                                        random_state=0,
+    #                                        affinity='nearest_neighbors').fit(
+    #   np.array([p['patch'].flatten() for p in patches]))
+    # clustering_disc = SpectralClustering(n_clusters=50,
+    #                                      assign_labels='discretize',
+    #                                      random_state=0,
+    #                                      affinity='nearest_neighbors').fit(
+    #   np.array([p['patch'].flatten() for p in patches]))
+    #
+    # plt.hist(clustering_disc.labels_, bins=50)
+    # plt.hist(clustering_kmeans.labels_, bins=50)
 
 
 
