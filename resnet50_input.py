@@ -275,11 +275,11 @@ def test_inputs(data_dir):
     images = [os.path.join(data_dir + 'BSDS500/data/images/test/', filenames_[i])
               for i in xrange(0, len(filenames_))]
     ###
-    GT = [os.path.join(data_dir + 'BSDS500/data/groundTruth/test/', filenames_[i])
+    GTs = [os.path.join(data_dir + 'BSDS500/data/groundTruth/test/', filenames_[i])
               for i in xrange(0, len(filenames_))]
     ###
     # images = ops.convert_to_tensor(images, dtype=dtypes.string)
-    queue = tf.compat.v1.train.slice_input_producer([images, GT], num_epochs=600, shuffle=True)
+    queue = tf.compat.v1.train.slice_input_producer([images, GTs], num_epochs=600, shuffle=True)
     image = tf.io.read_file(queue[0])
     GT = tf.io.read_file(queue[1])
     # image = tf.read_file(queue[0])
@@ -297,8 +297,8 @@ def test_inputs(data_dir):
     #    lambda: (new_size, compute_bigger_dim(h, w, new_size)),
     #    lambda: (compute_bigger_dim(w, h, new_size), new_size))
     #  image = tf.image.resize_images(image, [new_height_and_width[0], new_height_and_width[1]])
-    # bsds_mean = np.array([0.4342, 0.4428, 0.3673], dtype=np.float32)
-    # image = image - bsds_mean
+    bsds_mean = np.array([0.4342, 0.4428, 0.3673], dtype=np.float32)
+    image = image - bsds_mean
     image = tf.expand_dims(image, 0)
 
     # Set the shapes of tensors.
