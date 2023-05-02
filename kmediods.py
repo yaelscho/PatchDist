@@ -748,7 +748,7 @@ def getRep_coco():
               '148348.jpg', '67987.jpg', '207142.jpg', '161820.jpg', '500228.jpg', '263178.jpg', '117512.jpg', '12667.jpg',
               '215910.jpg', '473372.jpg', '124157.jpg', '3518.jpg', '9768.jpg', '450914.jpg', '563340.jpg', '372038.jpg',
               '433472.jpg', '35368.jpg', '491029.jpg', '504554.jpg', '459887.jpg', '420750.jpg', '58307.jpg', '543696.jpg',
-              ]
+              '114871.jpg', '43338.jpg', '96084.jpg', '265713.jpg', '197962.jpg', '112495.jpg', '157860.jpg', '320972.jpg']#bananas
 
   images, masks, labels = preprocess_COCO(imgNames, coco)
 
