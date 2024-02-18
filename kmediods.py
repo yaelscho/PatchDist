@@ -2817,7 +2817,7 @@ def get_representations():
 
         max_d = np.amax(dissim)
         affinity = 1 - (dissim / max_d)
-        affinity[affinity<0.5]=0
+        affinity[affinity<0.8]=0
         # sigma = np.percentile(dissim, 2)
         # affinity = np.exp(-dissim/sigma)
         D = np.zeros(affinity.shape)
