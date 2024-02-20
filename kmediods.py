@@ -9,6 +9,8 @@ import threading
 from collections import Counter
 # from itertools import combinations_with_replacement as comb
 from itertools import combinations as comb
+
+import scipy
 import sklearn
 import cv2
 import pandas
@@ -2725,10 +2727,10 @@ def get_representations():
         #   pickle.dump(patches, f)
         with open('patches_8_pascal_pca16_filtered_noBG_2023-11-16 12:18:53.731030.pkl', 'rb') as f:
           patches = pickle.load(f)
-        classes2inc = [82, 99, 123]
-        patches = [p for p in patches if p['seg'] in classes2inc]
-        for i in range(len(patches)):
-          patches[i]['idx']=i
+        # classes2inc = [82, 99, 123]
+        # patches = [p for p in patches if p['seg'] in classes2inc]
+        # for i in range(len(patches)):
+        #   patches[i]['idx']=i
         # new_patches = random.sample(patches, 1800)
         # with open('patches_8_pascal_pca16_filtered_sampled.pkl', 'rb') as f:
         #   new_patches = pickle.load(f)
@@ -2804,10 +2806,10 @@ def get_representations():
   #       with open('dissim_8_minipascal_avg_filtered_q0_noBG_{}.pkl'.format(datetime.now()), 'wb') as f:
   #         pickle.dump(dissim, f)
 
-        with open('dissim_8_minipascal_avg_filtered_q0_noBG_2024-02-07 11:26:37.549013.pkl', 'rb') as f:
-          dissim = pickle.load(f)
-        # with open('dissim_8_pascal_avg_filtered_q0_noBG_2023-11-16 12:32:29.144756.pkl', 'rb') as f:
+        # with open('dissim_8_minipascal_avg_filtered_q0_noBG_2024-02-07 11:26:37.549013.pkl', 'rb') as f:
         #   dissim = pickle.load(f)
+        with open('dissim_8_pascal_avg_filtered_q0_noBG_2023-11-16 12:32:29.144756.pkl', 'rb') as f:
+          dissim = pickle.load(f)
   #       with open('dissim_8_pascal_avg_filtered_q50_2023-09-28 14:59:31.762212.pkl', 'rb') as f:
   #         dissim_q50 = pickle.load(f)
   #       with open('dissim_8_pascal_avg_filtered_q80_2023-09-27 16:45:36.574020.pkl', 'rb') as f:
@@ -2816,16 +2818,17 @@ def get_representations():
   #         dissim_q100 = pickle.load(f)
 
         max_d = np.amax(dissim)
-        affinity = 1 - (dissim / max_d)
-        affinity[affinity<0.8]=0
-        # sigma = np.percentile(dissim, 2)
-        # affinity = np.exp(-dissim/sigma)
+        # affinity = 1 - (dissim / max_d)
+        sigma = np.percentile(dissim, 1)
+        # dissim[dissim>np.percentile(dissim, 10)]=np.amax(dissim)
+        affinity = np.exp(-dissim/sigma)
+        affinity[affinity<np.percentile(affinity, 95)]=0
         D = np.zeros(affinity.shape)
         for i in range(affinity.shape[0]):
           D[i, i] = sum(affinity[i, :])
         L = D- affinity
-        # L = np.matmul(np.matmul(np.diag(np.diag(D) ** (-1 / 2)), affinity), np.diag(np.diag(D) ** (-1 / 2)))
-        eig = np.linalg.eig(L)
+        # L = np.matmul(np.matmul(np.diag(np.diag(D) ** (-1 / 2)), L), np.diag(np.diag(D) ** (-1 / 2)))
+        eig = scipy.linalg.eig(L)
         idx = eig[0].argsort()
         eigenValues = eig[0][idx]
         eigenVectors = eig[1][:, idx]
@@ -2835,8 +2838,8 @@ def get_representations():
         vLens = [20]
         clustersCenterD = []
         inClustersD = []
-        # ns = range(10,61,10)
-        ns = [20]
+        ns = range(40,161,20)
+        # ns = [20]
         # fig2, ax2 = plt.subplots()
         segvals = [(p['seg']) for p in patches]
         classesPopDS = np.unique(segvals, return_counts=True, axis=0)
@@ -3110,6 +3113,7 @@ def get_representations():
         #     chance2cl[str(n)+'_'+str(n)+'_'+str(pu)] = chance2classify
         #   condHperC[str(n)+'_'+str(n)] = condHperClass
           for vLen in vLens:
+            vLen=n
             ims_true = []
             ims_false = []
             space = eigenVectors[:, :vLen]
